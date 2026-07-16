@@ -660,6 +660,12 @@ _FRONTEND_FRAMEWORK_RE = re.compile(r"\b(?:react|vue|angular)\b", re.IGNORECASE)
 _FRONTEND_ROLE_RE = re.compile(r"\bfront[\s-]?end\b", re.IGNORECASE)
 _FULLSTACK_ROLE_RE = re.compile(r"\bfull[\s-]?stack\b", re.IGNORECASE)
 _BACKEND_ROLE_RE = re.compile(r"\bback[\s-]?end\b", re.IGNORECASE)
+# Djinni titles often append a duty/scope suffix after a dash, e.g. "Full-
+# Stack Engineer (NestJS, Angular) - On-Call Support" — strip that trailing
+# " - <suffix>" before checking for exclusion keywords, so a real Fullstack
+# posting like that one doesn't get misread as a Support role just because
+# its own title happens to mention an on-call duty after the dash.
+_TITLE_SUFFIX_RE = re.compile(r"\s+-\s+.+$")
 
 
 def classify_category(title: str | None, description: str | None) -> str:
@@ -667,15 +673,17 @@ def classify_category(title: str | None, description: str | None) -> str:
     tagged "Other" rather than dropped, so a keyword-search run over noisy
     real-world results stays visible instead of silently vanishing.
 
-    Two decisions worth calling out:
+    Three decisions worth calling out:
 
     - Role-type exclusions (QA/support/SEO/PM/...) are checked against the
-      TITLE only, never the description. The description is free text that
-      can mention something like "on-call support rotation" as a duty of an
-      otherwise plainly Frontend role — matching that substring anywhere in
-      the body used to mislabel real Frontend postings as "Other". The
-      title is what the employer actually calls the role, same reasoning
-      already applied to infer_experience_level.
+      PRIMARY title segment only (before any " - <suffix>"), never the
+      description. The description is free text that can mention something
+      like "on-call support rotation" as a duty of an otherwise plainly
+      Frontend role — matching that substring anywhere in the body used to
+      mislabel real Frontend postings as "Other". Real titles also append
+      a duty suffix after a dash ("Full-Stack Engineer (NestJS, Angular) -
+      On-Call Support") that must be excluded the same way, or the primary
+      role name gets overridden by its own suffix.
     - React Native is explicitly bucketed as "Other", not "Frontend": it
       shares the "React" keyword but targets mobile apps, not the web —
       "Frontend" here means web front-end specifically. This is a
@@ -684,15 +692,16 @@ def classify_category(title: str | None, description: str | None) -> str:
     title_l = (title or "").lower()
     desc_l = (description or "").lower()
     combined = f"{title_l}\n{desc_l}"
+    primary_title_l = _TITLE_SUFFIX_RE.sub("", title_l)
 
     if _REACT_NATIVE_RE.search(combined):
         return "Other"
 
-    if _NON_DEV_ROLE_RE.search(title_l):
+    if _NON_DEV_ROLE_RE.search(primary_title_l):
         return "Other"
 
     has_frontend_framework = bool(_FRONTEND_FRAMEWORK_RE.search(combined))
-    is_fullstack_title = bool(_FULLSTACK_ROLE_RE.search(title_l))
+    is_fullstack_title = bool(_FULLSTACK_ROLE_RE.search(primary_title_l))
 
     if is_fullstack_title and has_frontend_framework:
         return "Fullstack"
@@ -700,13 +709,13 @@ def classify_category(title: str | None, description: str | None) -> str:
     # "strong backend focus" — an explicit backend title that isn't also a
     # fullstack title reads as backend-only, even if the description happens
     # to name-drop a frontend framework used by some adjacent team.
-    is_backend_only_title = bool(_BACKEND_ROLE_RE.search(title_l)) and not is_fullstack_title
+    is_backend_only_title = bool(_BACKEND_ROLE_RE.search(primary_title_l)) and not is_fullstack_title
 
     # "front-end"/"frontend" as a bare word is only trusted from the TITLE —
     # in the description it's too easy to catch it in an unrelated or even
     # negating sentence ("no frontend work involved"). A named framework
     # (React/Vue/Angular) is a strong enough signal to trust from either.
-    if not is_backend_only_title and (_FRONTEND_ROLE_RE.search(title_l) or has_frontend_framework):
+    if not is_backend_only_title and (_FRONTEND_ROLE_RE.search(primary_title_l) or has_frontend_framework):
         return "Frontend"
 
     return "Other"
