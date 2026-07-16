@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+
+# scraped output — personal data, not source code
+vacancies_frontend.csv
