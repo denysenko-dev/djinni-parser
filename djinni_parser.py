@@ -219,12 +219,13 @@ class DjinniScraper:
             # keep the vacancy with whatever the raw page text yields instead
             # of dropping it entirely.
             print(f"  [warn] no ld+json JobPosting found, using degraded parsing: {url}")
+            title = self._safe(lambda: soup.find("h1").get_text(strip=True))
             return Vacancy(
-                id=job_id, title=self._safe(lambda: soup.find("h1").get_text(strip=True)),
+                id=job_id, title=title,
                 company=None, url=url, matched_keyword=matched_keyword,
-                experience_level=infer_experience_level(page_text),
+                experience_level=self._experience_level(soup, title, None),
                 english_level=self._english_level(soup, page_text),
-                work_format=infer_work_format(page_text),
+                work_format=self._work_format(soup, {}, page_text),
                 location=None, salary_from=None, salary_to=None, salary_currency=None,
                 posted_date=None,
                 views_count=self._count(page_text, r"(\d+)\s*перегляд"),
@@ -241,12 +242,12 @@ class DjinniScraper:
             company=self._company(data),
             url=url,
             matched_keyword=matched_keyword,
-            experience_level=infer_experience_level(
-                f"{data.get('title') or ''}\n{description}",
-                months=(data.get("experienceRequirements") or {}).get("monthsOfExperience"),
+            experience_level=self._experience_level(
+                soup, data.get("title"),
+                (data.get("experienceRequirements") or {}).get("monthsOfExperience"),
             ),
             english_level=self._english_level(soup, description),
-            work_format=self._work_format(data, description),
+            work_format=self._work_format(soup, data, description),
             location=self._location(data),
             salary_from=salary_from,
             salary_to=salary_to,
@@ -276,7 +277,62 @@ class DjinniScraper:
         return value.get("minValue"), value.get("maxValue"), base_salary.get("currency")
 
     @staticmethod
-    def _work_format(data: dict, description: str) -> str | None:
+    def _summary_card(soup: BeautifulSoup):
+        """The right-rail summary card (experience/format/location/language
+        facts, rendered as plain <li>/<strong> text with no distinguishing
+        classes of their own) lives in its own "card card-body" div — a
+        *different* one from wherever span.csc--language ends up on the page
+        (their nesting isn't consistent across postings), so anchor on this
+        card's own content ("досвід" always appears here) instead of walking
+        up from another element. The card's li order and count also varies
+        (e.g. a salary line sometimes appears in between), so position-based
+        indexing isn't safe either — every lookup here matches by content."""
+        for card in soup.find_all("div", class_="card"):
+            classes = card.get("class") or []
+            if "card-body" in classes and "досвід" in card.get_text(" ", strip=True).lower():
+                return card
+        return None
+
+    @classmethod
+    def _structured_experience_years(cls, soup: BeautifulSoup) -> float | None:
+        card = cls._summary_card(soup)
+        if card is None:
+            return None
+        for li in card.find_all("li"):
+            lowered = li.get_text(" ", strip=True).lower()
+            if "досвід" not in lowered:
+                continue
+            if "без досвіду" in lowered:
+                return 0.0
+            m = re.search(r"(\d+(?:[.,]\d+)?)\s*рок", lowered)
+            if m:
+                return float(m.group(1).replace(",", "."))
+        return None
+
+    @classmethod
+    def _structured_work_format(cls, soup: BeautifulSoup) -> str | None:
+        card = cls._summary_card(soup)
+        if card is None:
+            return None
+        for li in card.find_all("li"):
+            text = li.get_text(" ", strip=True)
+            lowered = text.lower()
+            if any(w in lowered for w in ("офіс", "віддалено", "гібрид")):
+                return _normalize_structured_work_format(text)
+        return None
+
+    @classmethod
+    def _experience_level(cls, soup: BeautifulSoup, title: str | None, months: float | None) -> str | None:
+        years = cls._structured_experience_years(soup)
+        if years is None and months is not None:
+            years = months / 12
+        return infer_experience_level(title or "", years)
+
+    @classmethod
+    def _work_format(cls, soup: BeautifulSoup, data: dict, description: str) -> str | None:
+        structured = cls._structured_work_format(soup)
+        if structured:
+            return structured
         if data.get("jobLocationType") == "TELECOMMUTE":
             return "remote"
         return infer_work_format(description)
@@ -358,11 +414,18 @@ def _contains_word(lowered_text: str, words: tuple[str, ...]) -> bool:
     return re.search(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", lowered_text) is not None
 
 
-def infer_experience_level(text: str, months: float | None = None) -> str | None:
-    """Explicit junior/middle/senior wording (title/description) wins over
-    the numeric monthsOfExperience from the JSON-LD, since job titles like
-    "Strong Junior" (36 months required) disagree with a pure years cutoff."""
-    lowered = text.lower()
+def infer_experience_level(title: str, years: float | None = None) -> str | None:
+    """Explicit junior/middle/senior wording wins over a numeric years
+    threshold, since job titles like "Strong Junior" (3+ years required)
+    disagree with a pure years cutoff.
+
+    Only the TITLE is scanned for these words — not the description. The
+    description routinely mentions OTHER people's seniority ("working
+    alongside Senior developers who'll mentor you"), which has nothing to do
+    with the role's own required level; scanning it caused real
+    misclassifications (a "Trainee/Junior" posting read as "Senior" purely
+    because it name-dropped senior mentors)."""
+    lowered = (title or "").lower()
     if _contains_word(lowered, ("senior", "сеньйор", "старший")):
         return "Senior"
     if _contains_word(lowered, ("middle", "медіор", "мідл")):
@@ -372,8 +435,7 @@ def infer_experience_level(text: str, months: float | None = None) -> str | None
     if _contains_word(lowered, ("junior", "джуніор", "початків")):
         return "Junior"
 
-    if months is not None:
-        years = months / 12
+    if years is not None:
         if years >= 5:
             return "Senior"
         if years >= 2:
@@ -422,6 +484,22 @@ def infer_work_format(text: str) -> str | None:
     if "офіс" in lowered or "office" in lowered:
         return "office"
     return None
+
+
+def _normalize_structured_work_format(text: str) -> str | None:
+    """Djinni's own work-format field is a multi-select (e.g. "Офіс,
+    Гібридний формат роботи" = office AND hybrid both acceptable) — collapse
+    it to a comma-joined list of tags rather than picking just one, which
+    would silently drop an accepted format."""
+    lowered = text.lower()
+    formats = []
+    if "віддалено" in lowered:
+        formats.append("remote")
+    if "гібрид" in lowered:
+        formats.append("hybrid")
+    if "офіс" in lowered:
+        formats.append("office")
+    return ", ".join(formats) or None
 
 
 # ---- CSV / resume support ------------------------------------------------
