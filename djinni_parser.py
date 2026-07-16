@@ -42,9 +42,22 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://djinni.co"
 JOBS_PATH = "/jobs/"
 PRIMARY_KEYWORD = "JavaScript/Frontend"
+# NOTE: could combine all four into one all_keywords query to cut request
+# volume — tested this and it returns a materially different result set
+# (~1/15 overlap with a single-keyword search on page 1) but the exact
+# match semantics (OR-union vs something narrower) aren't confirmed, and a
+# wrong guess would silently under-collect vacancies with no error raised.
+# Left as four separate searches until that's verified against the site.
 SEARCH_KEYWORDS = ["React", "Frontend", "JavaScript", "TypeScript"]
 JOB_URL_RE = re.compile(r"^/jobs/(\d+)-[^/]+/$")
 
+# Deliberately a real desktop-browser string rather than a self-identifying
+# bot UA (e.g. "MyScraper/1.0 (+contact)") — trade-off: this makes the
+# scraper indistinguishable from a human visitor in Djinni's logs (so they
+# can't selectively rate-limit or contact this script's operator), but a
+# labelled bot UA tends to get blocked more readily, which would defeat the
+# personal-use goal. robots.txt compliance and rate limiting are the actual
+# courtesy mechanisms here, not UA transparency.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -135,38 +148,68 @@ class DjinniScraper:
     def _sleep(self) -> None:
         time.sleep(random.uniform(*self.delay_range))
 
-    def fetch(self, url: str) -> str | None:
+    def fetch(self, url: str, max_attempts: int = 3) -> str | None:
+        """Fetch a URL, retrying transient failures (timeout, 5xx) with
+        exponential backoff — a single flaky response used to permanently
+        skip that vacancy or truncate a keyword's pagination. 429/403/503
+        are NOT retried: those mean the site wants traffic to stop, not that
+        this one request had bad luck."""
         if not self.robots.allowed(url):
             print(f"  [skip] disallowed by robots.txt: {url}")
             return None
 
-        try:
-            resp = self.session.get(url, timeout=self.timeout)
-        except requests.exceptions.Timeout:
-            print(f"  [error] timeout: {url}")
-            self.errors += 1
-            return None
-        except requests.exceptions.RequestException as exc:
-            print(f"  [error] request failed ({exc}): {url}")
-            self.errors += 1
-            return None
-        finally:
-            self._sleep()
+        for attempt in range(1, max_attempts + 1):
+            resp = None
+            try:
+                resp = self.session.get(url, timeout=self.timeout)
+            except requests.exceptions.Timeout:
+                if attempt == max_attempts:
+                    print(f"  [error] timeout (after {max_attempts} attempts): {url}")
+                    self.errors += 1
+                    return None
+                print(f"  [retry {attempt}/{max_attempts - 1}] timeout: {url}")
+            except requests.exceptions.RequestException as exc:
+                print(f"  [error] request failed ({exc}): {url}")
+                self.errors += 1
+                return None
+            finally:
+                self._sleep()
 
-        if resp.status_code == 429:
-            raise BlockedError(f"HTTP 429 (rate limited) on {url}")
-        if resp.status_code in (403, 503):
-            raise BlockedError(f"HTTP {resp.status_code} (likely blocked/challenge) on {url}")
-        if resp.status_code != 200:
-            print(f"  [error] HTTP {resp.status_code}: {url}")
-            self.errors += 1
-            return None
+            if resp is None:
+                time.sleep(2 ** (attempt - 1))
+                continue
 
-        lowered = resp.text.lower()
-        if any(marker in lowered for marker in CAPTCHA_MARKERS):
-            raise BlockedError(f"CAPTCHA/challenge page detected on {url}")
+            if resp.status_code == 429:
+                raise BlockedError(f"HTTP 429 (rate limited) on {url}")
+            if resp.status_code in (403, 503):
+                raise BlockedError(f"HTTP {resp.status_code} (likely blocked/challenge) on {url}")
+            if resp.status_code >= 500:
+                if attempt == max_attempts:
+                    print(f"  [error] HTTP {resp.status_code} (after {max_attempts} attempts): {url}")
+                    self.errors += 1
+                    return None
+                print(f"  [retry {attempt}/{max_attempts - 1}] HTTP {resp.status_code}: {url}")
+                time.sleep(2 ** (attempt - 1))
+                continue
+            if resp.status_code != 200:
+                print(f"  [error] HTTP {resp.status_code}: {url}")
+                self.errors += 1
+                return None
 
-        return resp.text
+            # requests follows redirects automatically — the robots.txt check
+            # above only covers the URL we asked for, so re-check the URL we
+            # actually landed on in case a redirect sent us somewhere disallowed.
+            if resp.url != url and not self.robots.allowed(resp.url):
+                print(f"  [skip] redirect target disallowed by robots.txt: {resp.url}")
+                return None
+
+            lowered = resp.text.lower()
+            if any(marker in lowered for marker in CAPTCHA_MARKERS):
+                raise BlockedError(f"CAPTCHA/challenge page detected on {url}")
+
+            return resp.text
+
+        return None
 
     # ---- listing pages -------------------------------------------------
 
@@ -223,7 +266,7 @@ class DjinniScraper:
             return Vacancy(
                 id=job_id, title=title,
                 company=None, url=url, matched_keyword=matched_keyword,
-                experience_level=self._experience_level(soup, title, None),
+                experience_level=self._resolve_experience_level(soup, title, None),
                 english_level=self._english_level(soup, page_text),
                 work_format=self._work_format(soup, {}, page_text),
                 location=None, salary_from=None, salary_to=None, salary_currency=None,
@@ -235,6 +278,7 @@ class DjinniScraper:
 
         description = data.get("description") or page_text
         salary_from, salary_to, salary_currency = self._parse_salary(data.get("baseSalary"))
+        counter_text = self._counter_text(page_text, description)
 
         return Vacancy(
             id=job_id,
@@ -242,9 +286,8 @@ class DjinniScraper:
             company=self._company(data),
             url=url,
             matched_keyword=matched_keyword,
-            experience_level=self._experience_level(
-                soup, data.get("title"),
-                (data.get("experienceRequirements") or {}).get("monthsOfExperience"),
+            experience_level=self._resolve_experience_level(
+                soup, data.get("title"), self._months_of_experience(data),
             ),
             english_level=self._english_level(soup, description),
             work_format=self._work_format(soup, data, description),
@@ -253,8 +296,8 @@ class DjinniScraper:
             salary_to=salary_to,
             salary_currency=salary_currency,
             posted_date=(data.get("datePosted") or "")[:10] or None,
-            views_count=self._count(page_text, r"(\d+)\s*перегляд"),
-            responses_count=self._count(page_text, r"(\d+)\s*відгук"),
+            views_count=self._count(counter_text, r"(\d+)\s*перегляд"),
+            responses_count=self._count(counter_text, r"(\d+)\s*відгук"),
             description=description,
         )
 
@@ -270,11 +313,24 @@ class DjinniScraper:
         return None
 
     @staticmethod
-    def _parse_salary(base_salary: dict | None) -> tuple[float | None, float | None, str | None]:
-        if not base_salary:
+    def _parse_salary(base_salary) -> tuple[float | None, float | None, str | None]:
+        # ld+json fields on this site have twice turned out to be a
+        # different shape than schema.org's spec implies (jobLocation and
+        # hiringOrganization were each once a list/str instead of a dict) —
+        # guard baseSalary the same way rather than assuming .get() is safe.
+        if not isinstance(base_salary, dict):
             return None, None, None
-        value = base_salary.get("value") or {}
+        value = base_salary.get("value")
+        if not isinstance(value, dict):
+            value = {}
         return value.get("minValue"), value.get("maxValue"), base_salary.get("currency")
+
+    @staticmethod
+    def _months_of_experience(data: dict) -> float | None:
+        requirements = data.get("experienceRequirements")
+        if not isinstance(requirements, dict):
+            return None
+        return requirements.get("monthsOfExperience")
 
     @staticmethod
     def _summary_card(soup: BeautifulSoup):
@@ -322,7 +378,7 @@ class DjinniScraper:
         return None
 
     @classmethod
-    def _experience_level(cls, soup: BeautifulSoup, title: str | None, months: float | None) -> str | None:
+    def _resolve_experience_level(cls, soup: BeautifulSoup, title: str | None, months: float | None) -> str | None:
         years = cls._structured_experience_years(soup)
         if years is None and months is not None:
             years = months / 12
@@ -404,6 +460,18 @@ class DjinniScraper:
     def _count(text: str, pattern: str) -> int | None:
         m = re.search(pattern, text, re.IGNORECASE)
         return int(m.group(1)) if m else None
+
+    @staticmethod
+    def _counter_text(page_text: str, description: str | None) -> str:
+        """views_count/responses_count are extracted by regex over the whole
+        rendered page (no stable CSS selector found for that widget) — strip
+        the job description out first, since a coincidental "N відгуків"
+        written inside the description itself (e.g. a company bragging about
+        "500 відгуків клієнтів") would otherwise be mistaken for Djinni's own
+        applicant-response counter."""
+        if description:
+            return page_text.replace(description, "")
+        return page_text
 
 
 # ---- text-parsing heuristics --------------------------------------------
@@ -574,6 +642,14 @@ def main() -> int:
                 print(f"\n🛑 Site appears to be blocking requests: {exc}")
                 print(f"Stopping now. Saved {processed} vacancies so far.")
                 break
+            except Exception as exc:
+                # A page whose structure deviates from what the parsing code
+                # expects (this has happened twice already — jobLocation and
+                # hiringOrganization each once had an unexpected shape) should
+                # cost one vacancy, not the whole run's progress.
+                print(f"  [error] failed to parse {url}: {exc}")
+                scraper.errors += 1
+                continue
             if vacancy is None:
                 continue
             writer.writerow({f: getattr(vacancy, f) for f in CSV_FIELDS})
