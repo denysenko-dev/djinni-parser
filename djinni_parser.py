@@ -223,7 +223,7 @@ class DjinniScraper:
                 id=job_id, title=self._safe(lambda: soup.find("h1").get_text(strip=True)),
                 company=None, url=url, matched_keyword=matched_keyword,
                 experience_level=infer_experience_level(page_text),
-                english_level=infer_english_level(page_text),
+                english_level=self._english_level(soup, page_text),
                 work_format=infer_work_format(page_text),
                 location=None, salary_from=None, salary_to=None, salary_currency=None,
                 posted_date=None,
@@ -245,7 +245,7 @@ class DjinniScraper:
                 f"{data.get('title') or ''}\n{description}",
                 months=(data.get("experienceRequirements") or {}).get("monthsOfExperience"),
             ),
-            english_level=infer_english_level(description),
+            english_level=self._english_level(soup, description),
             work_format=self._work_format(data, description),
             location=self._location(data),
             salary_from=salary_from,
@@ -280,6 +280,31 @@ class DjinniScraper:
         if data.get("jobLocationType") == "TELECOMMUTE":
             return "remote"
         return infer_work_format(description)
+
+    @staticmethod
+    def _extract_language_levels(soup: BeautifulSoup) -> dict[str, str]:
+        """Djinni renders required language levels in a dedicated structured
+        block (span.csc--language, e.g. "Англійська" / "A2 - Елементарний")
+        that is often NOT echoed anywhere in the free-text job description —
+        so a vacancy with no "English"/"англійська" mention in the description
+        can still have an explicit level here. Scrape it directly instead of
+        only guessing from text."""
+        levels = {}
+        for span in soup.find_all("span", class_="csc--language"):
+            primary = span.find("span", class_="csc__primary")
+            secondary = span.find("span", class_="csc__secondary")
+            if primary and secondary:
+                levels[primary.get_text(strip=True)] = secondary.get_text(strip=True)
+        return levels
+
+    @classmethod
+    def _english_level(cls, soup: BeautifulSoup, description: str) -> str | None:
+        for language, level in cls._extract_language_levels(soup).items():
+            if "англ" in language.lower() or "english" in language.lower():
+                return level
+        # fall back to the free-text heuristic for the rare page where the
+        # structured language block is missing
+        return infer_english_level(description)
 
     @staticmethod
     def _company(data: dict) -> str | None:
