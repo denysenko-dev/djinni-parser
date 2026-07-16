@@ -233,7 +233,7 @@ class DjinniScraper:
         return Vacancy(
             id=job_id,
             title=data.get("title"),
-            company=(data.get("hiringOrganization") or {}).get("name"),
+            company=self._company(data),
             url=url,
             matched_keyword=matched_keyword,
             experience_level=infer_experience_level(
@@ -277,15 +277,34 @@ class DjinniScraper:
         return infer_work_format(description)
 
     @staticmethod
+    def _company(data: dict) -> str | None:
+        org = data.get("hiringOrganization")
+        if isinstance(org, dict):
+            return org.get("name")
+        if isinstance(org, str):
+            # employers can post as "confidential" instead of a named Organization
+            return org or None
+        return None
+
+    @staticmethod
     def _location(data: dict) -> str | None:
-        address = (data.get("jobLocation") or {}).get("address")
-        if not address:
+        job_location = data.get("jobLocation")
+        if isinstance(job_location, dict):
+            job_location = [job_location]
+        if not isinstance(job_location, list):
             return None
-        locality = address.get("addressLocality")
-        if isinstance(locality, list):
-            locality = ", ".join(locality)
-        country = address.get("addressCountry")
-        return ", ".join(p for p in (locality, country) if p) or None
+
+        parts = []
+        for place in job_location:
+            address = (place or {}).get("address") or {}
+            locality = address.get("addressLocality")
+            if isinstance(locality, list):
+                locality = ", ".join(locality)
+            country = address.get("addressCountry")
+            text = ", ".join(p for p in (locality, country) if p)
+            if text:
+                parts.append(text)
+        return "; ".join(parts) or None
 
     @staticmethod
     def _safe(getter):
