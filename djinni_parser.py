@@ -59,16 +59,21 @@ CAPTCHA_MARKERS = (
 )
 
 ENGLISH_LEVELS = (
+    # CEFR letter codes ("English level B2+") first — unambiguous, so they
+    # outrank a vaguer qualifier mentioned in the same sentence (e.g.
+    # "Strong communication skills and English at B2 level" should read B2)
+    "A1", "A2", "B1", "B2", "C1", "C2",
     # formal CEFR-ish taxonomy Djinni uses in its own filters
-    "No English", "Beginner", "Elementary", "Pre-Intermediate", "Intermediate",
-    "Upper-Intermediate", "Advanced", "Fluent", "Proficient", "Native",
+    # "Upper-Intermediate"/"Pre-Intermediate" must be checked before plain
+    # "Intermediate" — that word is a substring of both, so the shorter form
+    # would otherwise win and silently downgrade the real level
+    "No English", "Beginner", "Elementary", "Pre-Intermediate",
+    "Upper-Intermediate", "Intermediate", "Advanced", "Fluent", "Proficient", "Native",
     "Без англійської", "Початковий", "Елементарний", "Середній",
     "Вище середнього", "Просунутий",
     # informal qualifiers employers actually write in free-text descriptions
     "Strong", "Good", "Excellent", "Working", "Conversational", "Basic",
     "Вільна", "Впевнена", "Хороша", "Розмовна",
-    # CEFR letter codes ("English level B2+")
-    "A1", "A2", "B1", "B2", "C1", "C2",
 )
 
 CSV_FIELDS = [
@@ -352,6 +357,22 @@ def infer_experience_level(text: str, months: float | None = None) -> str | None
     return None
 
 
+_CEFR_CYRILLIC_LOOKALIKE_RE = re.compile(r"[АВС](?=[12]\b)")
+_CEFR_CYRILLIC_LOOKALIKES = {"А": "A", "В": "B", "С": "C"}
+
+
+def _normalize_cefr_codes(text: str) -> str:
+    """Ukrainian-language postings sometimes write CEFR codes ("B1", "C1")
+    with Cyrillic look-alike letters (Cyrillic А/В/С instead of Latin A/B/C)
+    since the surrounding sentence is Cyrillic. Only touch a letter directly
+    followed by "1"/"2" (the CEFR-code shape) — a blanket replacement would
+    also corrupt ordinary Cyrillic words that start with the same letters
+    (e.g. "Середній", "Вільна")."""
+    return _CEFR_CYRILLIC_LOOKALIKE_RE.sub(
+        lambda m: _CEFR_CYRILLIC_LOOKALIKES[m.group(0)], text
+    )
+
+
 def infer_english_level(text: str) -> str | None:
     """Best-effort only: employers write this as free text ("Strong English",
     "англійська B2"), not a fixed vocabulary, so this will miss phrasings
@@ -359,8 +380,8 @@ def infer_english_level(text: str) -> str | None:
     once (e.g. "communicate in English" AND, separately, "English level B2+")
     — scan every mention, not just the first, and return the first one that
     actually carries a recognizable level."""
-    for m in re.finditer(r"[^\n]{0,30}(?:english|англ[іi]йська)[^\n]{0,40}", text, re.IGNORECASE):
-        window = m.group(0).lower()
+    for m in re.finditer(r"[^\n]{0,60}(?:english|англ[іi]йськ\w*)[^\n]{0,40}", text, re.IGNORECASE):
+        window = _normalize_cefr_codes(m.group(0)).lower()
         for level in ENGLISH_LEVELS:
             if level.lower() in window:
                 return level
