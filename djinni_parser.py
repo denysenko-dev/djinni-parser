@@ -232,9 +232,9 @@ class DjinniScraper:
 
     # ---- listing pages -------------------------------------------------
 
-    def collect_job_urls(self, keyword: str, max_pages: int) -> set[str]:
+    def collect_job_urls(self, keyword: str, max_pages: int, start_page: int = 1) -> set[str]:
         found: set[str] = set()
-        for page in range(1, max_pages + 1):
+        for page in range(start_page, max_pages + 1):
             params = {
                 "primary_keyword": PRIMARY_KEYWORD,
                 "all_keywords": keyword,
@@ -867,6 +867,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="vacancies_frontend.csv", type=Path)
     parser.add_argument("--max-pages", default=20, type=int, help="max listing pages per keyword")
+    parser.add_argument("--start-page", default=1, type=int, help="skip to this page per keyword instead of "
+                         "re-walking from page 1 (Djinni's page 1 sort can shift between runs as new "
+                         "postings land, so a high --start-page can skip a handful of new page-1..N listings "
+                         "in exchange for not re-spending the request budget on pages already covered)")
     parser.add_argument("--delay-min", default=2.0, type=float)
     parser.add_argument("--delay-max", default=4.0, type=float)
     parser.add_argument("--dry-run", action="store_true", help="only collect+count job URLs, don't visit them")
@@ -881,7 +885,7 @@ def main() -> int:
     try:
         for keyword in SEARCH_KEYWORDS:
             print(f"Searching keyword: {keyword}")
-            urls = scraper.collect_job_urls(keyword, args.max_pages)
+            urls = scraper.collect_job_urls(keyword, args.max_pages, args.start_page)
             print(f"  -> {len(urls)} unique job URLs for '{keyword}'")
             for u in urls:
                 url_keyword.setdefault(u, keyword)  # first keyword to find it wins
