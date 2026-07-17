@@ -4,3 +4,4 @@ __pycache__/
 
 # scraped output — personal data, not source code
 vacancies_frontend.csv
+archive/
