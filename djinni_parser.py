@@ -13,9 +13,11 @@ Compliance notes:
 - Uses a plain desktop-browser User-Agent and a randomized 2-4s delay
   between every request; makes no parallel/concurrent requests.
 - Does not log in or use any authenticated session.
-- Stops the whole run immediately on HTTP 429, a CAPTCHA/challenge page,
-  or repeated timeouts, instead of retrying against a site that is
-  signalling it wants the traffic to stop.
+- Stops the whole run immediately on HTTP 429/403/503 or a CAPTCHA/challenge
+  page, instead of retrying against a site that is signalling it wants the
+  traffic to stop. A timeout or 5xx is treated as transient instead: it's
+  retried up to 3x with backoff, and only that one page/vacancy is skipped
+  if it still fails — the run itself continues.
 
 robots.txt is a technical courtesy signal to crawlers, not a substitute
 for a site's Terms of Service. Review Djinni's ToS yourself before using
